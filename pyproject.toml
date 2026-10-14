@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ilias-sync"
+dynamic = ["version"]
+description = "One-Way-Sync aller Kursdateien von myILIAS (KH Freiburg) in einen lokalen Ordner"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "requests",
+    "beautifulsoup4",
+    "keyring; sys_platform != 'darwin'",
+]
+
+[project.scripts]
+ilias-sync = "ilias_sync:main"
+
+[tool.setuptools]
+py-modules = ["ilias_sync"]
+
+[tool.setuptools.dynamic]
+version = { attr = "ilias_sync.__version__" }

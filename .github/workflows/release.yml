@@ -1,0 +1,97 @@
+name: Build & Release
+
+# Baut fertige Programme für Windows, macOS (Apple Silicon + Intel) und Linux.
+# - Bei jedem Push/PR: Build + Smoke-Test, Binaries als Workflow-Artefakte.
+# - Bei einem Tag "v*" (z. B. v1.1.0): zusätzlich GitHub-Release mit den Binaries.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: ilias-sync-windows-x64.exe
+          - os: macos-latest        # Apple Silicon (arm64)
+            asset: ilias-sync-macos-arm64
+          - os: macos-15-intel      # Intel (x86_64)
+            asset: ilias-sync-macos-x64
+          - os: ubuntu-22.04        # ältere glibc → läuft auf mehr Distributionen
+            asset: ilias-sync-linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Abhängigkeiten installieren
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Tag-Version prüfen
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          code_version=$(python -c "import ilias_sync; print(ilias_sync.__version__)")
+          if [ "v$code_version" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} passt nicht zu __version__ = $code_version in ilias_sync.py"
+            exit 1
+          fi
+
+      - name: Binary bauen
+        shell: bash
+        run: |
+          pyinstaller --onefile --name ilias-sync --console --clean ilias_sync.py
+          src=dist/ilias-sync; [ "$RUNNER_OS" = "Windows" ] && src=dist/ilias-sync.exe
+          mkdir -p out && cp "$src" "out/${{ matrix.asset }}"
+
+      - name: Smoke-Test
+        shell: bash
+        run: |
+          bin=out/${{ matrix.asset }}
+          "$bin" --version
+          "$bin" --selftest
+          "$bin" --help > /dev/null
+          # ohne Einrichtung muss sync sauber mit Hinweis abbrechen
+          msg=$(ILIAS_PASSWORD=x "$bin" sync 2>&1 || true)
+          echo "$msg"
+          echo "$msg" | grep -q "Noch nicht eingerichtet"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: out/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: Prüfsummen
+        run: cd out && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true

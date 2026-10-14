@@ -3,11 +3,16 @@
 ilias-sync – One-Way-Sync aller Dateien aus deinen Kursen auf myILIAS (KH Freiburg)
 in ein lokales Verzeichnis. Lädt nur neue oder geänderte Dateien herunter.
 
+Läuft auf macOS, Windows und Linux.
+
 Befehle:
-  ilias-sync setup                 Zugangsdaten + Zielordner einrichten (Passwort -> macOS-Schlüsselbund)
+  ilias-sync                       Ohne Befehl: Einrichtung (falls nötig), dann Sync
+  ilias-sync setup                 Zugangsdaten + Zielordner einrichten (Passwort -> Schlüsselbund
+                                   bzw. Windows-Anmeldeinformationsverwaltung)
   ilias-sync courses               Gefundene Kurse/Gruppen auflisten
   ilias-sync sync [--dry-run]      Synchronisieren
-  ilias-sync schedule --hours 2    Automatisch alle 2 Stunden synchronisieren (launchd)
+  ilias-sync schedule --hours 2    Automatisch alle 2 Stunden synchronisieren
+                                   (macOS: launchd, Windows: Aufgabenplanung, Linux: systemd-Timer)
   ilias-sync schedule --remove     Automatik wieder entfernen
 """
 from __future__ import annotations
@@ -16,7 +21,9 @@ import argparse
 import getpass
 import json
 import os
+import platform
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -36,17 +43,40 @@ except ImportError:
 
 # --------------------------------------------------------------------------- Konstanten
 
+__version__ = "1.1.0"
+
 BASE_URL = "https://myilias.kh-freiburg.de/"
 CLIENT_ID = "kh-freiburg"
 APP = "ilias-sync"
-CONFIG_DIR = Path.home() / ".config" / APP
+STATE_NAME = ".ilias-sync-state.json"
+
+IS_WINDOWS = sys.platform == "win32"
+IS_MACOS = sys.platform == "darwin"
+FROZEN = getattr(sys, "frozen", False)  # als PyInstaller-Binary gestartet
+
+if IS_WINDOWS:
+    _roaming = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+    _local = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    CONFIG_DIR = _roaming / APP
+    DEBUG_DIR = _local / APP / "debug"
+    LOG_FILE = _local / APP / f"{APP}.log"
+elif IS_MACOS:
+    CONFIG_DIR = Path.home() / ".config" / APP
+    DEBUG_DIR = Path.home() / ".cache" / APP / "debug"
+    LOG_FILE = Path.home() / "Library" / "Logs" / f"{APP}.log"
+else:
+    CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / APP
+    DEBUG_DIR = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / APP / "debug"
+    LOG_FILE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / APP / f"{APP}.log"
 CONFIG_FILE = CONFIG_DIR / "config.json"
-DEBUG_DIR = Path.home() / ".cache" / APP / "debug"
+
 KEYCHAIN_SERVICE = "ilias-sync-kh-freiburg"
 LAUNCHD_LABEL = "de.kh-freiburg.ilias-sync"
 LAUNCHD_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
-LOG_FILE = Path.home() / "Library" / "Logs" / f"{APP}.log"
-STATE_NAME = ".ilias-sync-state.json"
+WIN_TASK_NAME = "ilias-sync"
+SYSTEMD_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "systemd" / "user"
+PW_STORE = ("in der Windows-Anmeldeinformationsverwaltung" if IS_WINDOWS
+            else "im macOS-Schlüsselbund" if IS_MACOS else "im System-Schlüsselbund")
 
 AUTH_MODES = {
     "student": "Studenten AD",
@@ -77,30 +107,45 @@ def load_config() -> dict:
     if not CONFIG_FILE.exists():
         log("Noch nicht eingerichtet. Bitte zuerst ausführen:  ilias-sync setup")
         sys.exit(1)
-    return json.loads(CONFIG_FILE.read_text())
+    return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
 
 
 def save_config(cfg: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
 
+
+# Unter macOS wird das Passwort über /usr/bin/security abgelegt: Der Schlüsselbund-Eintrag vertraut dann
+# diesem Systemprogramm statt dem (unsignierten, bei jedem Update wechselnden) Binary – keine Rückfragen.
+# Windows/Linux nutzen das keyring-Paket (Anmeldeinformationsverwaltung bzw. Secret Service).
 
 def keychain_get(user: str) -> Optional[str]:
     env = os.environ.get("ILIAS_PASSWORD")
     if env:
         return env
-    r = subprocess.run(
-        ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", user, "-w"],
-        capture_output=True, text=True,
-    )
-    return r.stdout.rstrip("\n") if r.returncode == 0 else None
+    if IS_MACOS:
+        r = subprocess.run(
+            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", user, "-w"],
+            capture_output=True, text=True,
+        )
+        return r.stdout.rstrip("\n") if r.returncode == 0 else None
+    try:
+        import keyring
+        return keyring.get_password(KEYCHAIN_SERVICE, user)
+    except Exception as e:  # noqa
+        vlog(f"Schlüsselbund nicht verfügbar: {e}")
+        return None
 
 
 def keychain_set(user: str, password: str) -> None:
-    subprocess.run(
-        ["security", "add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", user, "-w", password],
-        check=True, capture_output=True,
-    )
+    if IS_MACOS:
+        subprocess.run(
+            ["security", "add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", user, "-w", password],
+            check=True, capture_output=True,
+        )
+        return
+    import keyring
+    keyring.set_password(KEYCHAIN_SERVICE, user, password)
 
 
 # --------------------------------------------------------------------------- Hilfsfunktionen
@@ -111,6 +156,8 @@ def safe_name(name: str, max_len: int = 150) -> str:
     name = re.sub(r"\s+", " ", name).strip().strip(".")
     if not name:
         name = "unbenannt"
+    if re.fullmatch(r"(?i)(con|prn|aux|nul|com\d|lpt\d)(\..*)?", name):  # unter Windows reserviert
+        name = "_" + name
     if len(name) > max_len:
         stem, dot, ext = name.rpartition(".")
         if dot and len(ext) <= 8:
@@ -183,10 +230,33 @@ def is_login_page(html: str) -> bool:
     return bool(re.search(r'type="password"', html)) and ("login" in html.lower() or "ilstartupgui" in html.lower())
 
 
+_WIN_TOAST = r"""
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+$t = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent(
+    [Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+$x = $t.GetElementsByTagName('text')
+$x.Item(0).AppendChild($t.CreateTextNode($env:ILIAS_NOTIFY_TITLE)) > $null
+$x.Item(1).AppendChild($t.CreateTextNode($env:ILIAS_NOTIFY_MSG)) > $null
+$app = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show(
+    [Windows.UI.Notifications.ToastNotification]::new($t))
+"""
+
+
 def notify(title: str, msg: str) -> None:
-    msg = msg.replace('"', "'")
-    subprocess.run(["osascript", "-e", f'display notification "{msg}" with title "{title}"'],
-                   capture_output=True)
+    try:
+        if IS_MACOS:
+            msg = msg.replace('"', "'")
+            subprocess.run(["osascript", "-e", f'display notification "{msg}" with title "{title}"'],
+                           capture_output=True)
+        elif IS_WINDOWS:
+            env = dict(os.environ, ILIAS_NOTIFY_TITLE=title, ILIAS_NOTIFY_MSG=msg)
+            subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", _WIN_TOAST],
+                           env=env, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        elif shutil.which("notify-send"):
+            subprocess.run(["notify-send", title, msg], capture_output=True)
+    except Exception as e:  # noqa – eine fehlende Mitteilung soll den Sync nie abbrechen
+        vlog(f"Mitteilung fehlgeschlagen: {e}")
 
 
 # --------------------------------------------------------------------------- Parsing
@@ -250,13 +320,13 @@ class Ilias:
         self.password = password
         self.auth_mode = auth_mode
         self.s = requests.Session()
-        self.s.headers["User-Agent"] = f"{APP}/1.0 (+macOS)"
+        self.s.headers["User-Agent"] = f"{APP}/{__version__} ({platform.system()})"
         self.logged_in = False
 
     def _dump(self, name: str, html: str) -> None:
         if DEBUG:
             DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-            (DEBUG_DIR / f"{int(time.time()*1000)}_{safe_name(name, 60)}.html").write_text(html)
+            (DEBUG_DIR / f"{int(time.time()*1000)}_{safe_name(name, 60)}.html").write_text(html, encoding="utf-8")
 
     def login(self) -> None:
         r = self.s.get(urljoin(BASE_URL, f"login.php?client_id={CLIENT_ID}&cmd=force_login&lang=de"), timeout=30)
@@ -379,7 +449,8 @@ class Syncer:
         self.root = root
         self.dry = dry_run
         self.state_file = root / STATE_NAME
-        self.state: Dict[str, dict] = json.loads(self.state_file.read_text()) if self.state_file.exists() else {}
+        self.state: Dict[str, dict] = json.loads(self.state_file.read_text(encoding="utf-8")) \
+            if self.state_file.exists() else {}
         self.visited: set = set()
         self.new: List[str] = []
         self.updated: List[str] = []
@@ -389,7 +460,7 @@ class Syncer:
         if self.dry:
             return
         tmp = self.state_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.state, indent=1, ensure_ascii=False))
+        tmp.write_text(json.dumps(self.state, indent=1, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, self.state_file)
 
     def owner_of(self, rel: str) -> Optional[str]:
@@ -491,7 +562,8 @@ class Syncer:
 def make_client(cfg: dict) -> Ilias:
     pw = keychain_get(cfg["username"])
     if not pw:
-        log("Kein Passwort im Schlüsselbund gefunden. Bitte  ilias-sync setup  ausführen.")
+        log(f"Kein Passwort {PW_STORE} gefunden. Bitte  ilias-sync setup  ausführen "
+            "(oder Umgebungsvariable ILIAS_PASSWORD setzen).")
         sys.exit(1)
     return Ilias(cfg["username"], pw, cfg.get("auth_mode", "student"))
 
@@ -510,14 +582,14 @@ def filter_courses(cfg: dict, courses: List[Item]) -> List[Item]:
 
 
 def cmd_setup(_args) -> None:
-    cfg = json.loads(CONFIG_FILE.read_text()) if CONFIG_FILE.exists() else {}
+    cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8")) if CONFIG_FILE.exists() else {}
     print("Einrichtung für myILIAS (KH Freiburg)\n")
     user = input(f"Anmeldename [{cfg.get('username', '')}]: ").strip() or cfg.get("username", "")
     print("Anmeldungsart:  1) Studenten AD   2) Mitarbeiter AD   3) ILIAS-Datenbank")
     default_mode = {"student": "1", "mitarbeiter": "2", "ilias": "3"}.get(cfg.get("auth_mode", "student"), "1")
     choice = input(f"Auswahl [{default_mode}]: ").strip() or default_mode
     mode = {"1": "student", "2": "mitarbeiter", "3": "ilias"}.get(choice, "student")
-    pw = getpass.getpass("Passwort (wird im macOS-Schlüsselbund gespeichert): ")
+    pw = getpass.getpass(f"Passwort (wird {PW_STORE} gespeichert): ")
     default_dir = cfg.get("target_dir", str(Path.home() / "ILIAS"))
     target = input(f"Zielordner [{default_dir}]: ").strip() or default_dir
     target = str(Path(target).expanduser().resolve())
@@ -532,7 +604,11 @@ def cmd_setup(_args) -> None:
         sys.exit(1)
     print(f"✓ Angemeldet – {len(courses)} Kurse/Gruppen gefunden.")
 
-    keychain_set(user, pw)
+    try:
+        keychain_set(user, pw)
+    except Exception as e:  # noqa
+        print(f"✗ Passwort konnte nicht gespeichert werden ({e}).\n"
+              "  Alternativ das Passwort über die Umgebungsvariable ILIAS_PASSWORD übergeben.")
     cfg.update({"username": user, "auth_mode": mode, "target_dir": target})
     cfg.setdefault("include", [])
     cfg.setdefault("exclude", [])
@@ -583,7 +659,14 @@ def cmd_sync(args) -> None:
         notify("ILIAS-Sync", f"{n} neue, {u} aktualisierte Dateien: " + ", ".join(names))
 
 
-def cmd_schedule(args) -> None:
+def self_command() -> List[str]:
+    """Befehl, mit dem sich ilias-sync selbst aufruft (Binary oder Python-Skript)."""
+    if FROZEN:
+        return [str(Path(sys.executable).resolve())]
+    return [str(Path(sys.executable).resolve()), str(Path(__file__).resolve())]
+
+
+def schedule_macos(args) -> None:
     uid = os.getuid()
     if LAUNCHD_PLIST.exists():
         subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(LAUNCHD_PLIST)], capture_output=True)
@@ -591,10 +674,9 @@ def cmd_schedule(args) -> None:
         LAUNCHD_PLIST.unlink(missing_ok=True)
         print("Automatischer Sync entfernt.")
         return
-    load_config()
-    script = Path(__file__).resolve()
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     LAUNCHD_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    prog = "\n".join(f"    <string>{a}</string>" for a in self_command() + ["sync", "--notify"])
     plist = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -602,10 +684,7 @@ def cmd_schedule(args) -> None:
   <key>Label</key><string>{LAUNCHD_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>{sys.executable}</string>
-    <string>{script}</string>
-    <string>sync</string>
-    <string>--notify</string>
+{prog}
   </array>
   <key>StartInterval</key><integer>{int(args.hours * 3600)}</integer>
   <key>RunAtLoad</key><true/>
@@ -614,7 +693,7 @@ def cmd_schedule(args) -> None:
 </dict>
 </plist>
 """
-    LAUNCHD_PLIST.write_text(plist)
+    LAUNCHD_PLIST.write_text(plist, encoding="utf-8")
     r = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(LAUNCHD_PLIST)], capture_output=True, text=True)
     if r.returncode != 0:
         subprocess.run(["launchctl", "load", str(LAUNCHD_PLIST)], check=False)
@@ -624,29 +703,151 @@ def cmd_schedule(args) -> None:
           "erlaubt werden soll – „Immer erlauben“ wählen.")
 
 
+def schedule_windows(args) -> None:
+    subprocess.run(["schtasks", "/Delete", "/TN", WIN_TASK_NAME, "/F"], capture_output=True)
+    if args.remove:
+        print("Automatischer Sync entfernt.")
+        return
+    # conhost --headless startet das Konsolenprogramm ohne aufpoppendes Fenster
+    conhost = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "conhost.exe"
+    cmd = subprocess.list2cmdline(self_command() + ["--log-file", str(LOG_FILE), "sync", "--notify"])
+    tr = f'"{conhost}" --headless {cmd}' if conhost.exists() else cmd
+    minutes = max(1, round(args.hours * 60))
+    sched = ["/SC", "MINUTE", "/MO", str(minutes)] if minutes < 1440 \
+        else ["/SC", "DAILY", "/MO", str(max(1, round(args.hours / 24)))]
+    r = subprocess.run(["schtasks", "/Create", "/TN", WIN_TASK_NAME, "/TR", tr, *sched, "/F"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"✗ Aufgabe konnte nicht angelegt werden: {(r.stderr or r.stdout).strip()}")
+        sys.exit(1)
+    subprocess.run(["schtasks", "/Run", "/TN", WIN_TASK_NAME], capture_output=True)
+    print(f"✓ Sync läuft jetzt alle {args.hours:g} Stunde(n) automatisch (und sofort einmal).")
+    print(f"  Aufgabe „{WIN_TASK_NAME}“ in der Windows-Aufgabenplanung.  Log: {LOG_FILE}")
+
+
+def schedule_linux(args) -> None:
+    service = SYSTEMD_DIR / f"{APP}.service"
+    timer = SYSTEMD_DIR / f"{APP}.timer"
+    if not shutil.which("systemctl"):
+        print("systemd nicht gefunden. Alternativ per crontab -e eintragen, z. B.:")
+        print(f"  0 */2 * * * {subprocess.list2cmdline(self_command())} sync --notify >> {LOG_FILE} 2>&1")
+        sys.exit(1)
+    subprocess.run(["systemctl", "--user", "disable", "--now", timer.name], capture_output=True)
+    if args.remove:
+        service.unlink(missing_ok=True)
+        timer.unlink(missing_ok=True)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+        print("Automatischer Sync entfernt.")
+        return
+    SYSTEMD_DIR.mkdir(parents=True, exist_ok=True)
+    exec_start = subprocess.list2cmdline(self_command() + ["--log-file", str(LOG_FILE), "sync", "--notify"])
+    service.write_text(f"[Unit]\nDescription=ilias-sync\n\n[Service]\nType=oneshot\nExecStart={exec_start}\n",
+                       encoding="utf-8")
+    timer.write_text(f"[Unit]\nDescription=ilias-sync Timer\n\n[Timer]\nOnBootSec=2min\nOnActiveSec=10s\n"
+                     f"OnUnitActiveSec={int(args.hours * 3600)}s\n\n"
+                     f"[Install]\nWantedBy=timers.target\n", encoding="utf-8")
+    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+    r = subprocess.run(["systemctl", "--user", "enable", "--now", timer.name], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"✗ Timer konnte nicht aktiviert werden: {r.stderr.strip()}")
+        sys.exit(1)
+    print(f"✓ Sync läuft jetzt alle {args.hours:g} Stunde(n) automatisch (und sofort einmal).")
+    print(f"  Log: {LOG_FILE}")
+
+
+def cmd_schedule(args) -> None:
+    if not args.remove:
+        load_config()
+    if IS_MACOS:
+        schedule_macos(args)
+    elif IS_WINDOWS:
+        schedule_windows(args)
+    else:
+        schedule_linux(args)
+
+
+def ask_yes(question: str, default: bool = True) -> bool:
+    ans = input(f"{question} [{'J/n' if default else 'j/N'}]: ").strip().lower()
+    return default if not ans else ans in ("j", "ja", "y", "yes")
+
+
+def cmd_default(_args) -> None:
+    """Ohne Befehl gestartet (z. B. per Doppelklick): beim ersten Mal einrichten, sonst einfach syncen."""
+    sync_args = argparse.Namespace(dry_run=False, notify=False)
+    if not CONFIG_FILE.exists():
+        cmd_setup(_args)
+        print()
+        if ask_yes("Automatisch alle 2 Stunden im Hintergrund synchronisieren?"):
+            cmd_schedule(argparse.Namespace(hours=2.0, remove=False))
+            return  # der Hintergrund-Job synchronisiert sofort einmal
+        if not ask_yes("Jetzt synchronisieren?"):
+            return
+    cmd_sync(sync_args)
+
+
+def setup_console(log_file: Optional[str]) -> None:
+    if log_file:  # Hintergrundläufe (Windows/Linux) schreiben direkt in eine Logdatei
+        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+        f = open(log_file, "a", encoding="utf-8", buffering=1)
+        sys.stdout = sys.stderr = f
+        return
+    for stream in (sys.stdout, sys.stderr):  # Windows-Konsolen sind oft nicht UTF-8 (✓, ▸, Umlaute)
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
+def selftest() -> None:
+    """Für die Build-Pipeline: prüft, ob alle Abhängigkeiten im Binary stecken."""
+    print(f"{APP} {__version__} auf {platform.system()} {platform.machine()}, Python {platform.python_version()}")
+    print(f"requests {requests.__version__}, Konfiguration: {CONFIG_FILE}")
+    if not IS_MACOS:
+        import keyring
+        backend = keyring.get_keyring()
+        print(f"keyring-Backend: {type(backend).__module__}.{type(backend).__name__}")
+        if IS_WINDOWS and "Windows" not in type(backend).__name__:
+            sys.exit("Windows-Anmeldeinformationsverwaltung nicht verfügbar")
+
+
 def main() -> None:
     global VERBOSE, DEBUG
     p = argparse.ArgumentParser(prog=APP, description="One-Way-Sync deiner myILIAS-Kursdateien (KH Freiburg).")
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("-v", "--verbose", action="store_true", help="ausführliche Ausgabe")
     p.add_argument("--debug", action="store_true", help=f"abgerufene HTML-Seiten nach {DEBUG_DIR} speichern")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    p.add_argument("--log-file", help=argparse.SUPPRESS)
+    p.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
+    p.set_defaults(func=cmd_default)
+    sub = p.add_subparsers(dest="cmd")
     sub.add_parser("setup", help="Zugangsdaten und Zielordner einrichten").set_defaults(func=cmd_setup)
     sub.add_parser("courses", help="gefundene Kurse anzeigen").set_defaults(func=cmd_courses)
     s = sub.add_parser("sync", help="Dateien synchronisieren")
     s.add_argument("-n", "--dry-run", action="store_true", help="nur anzeigen, nichts herunterladen")
-    s.add_argument("--notify", action="store_true", help="macOS-Mitteilung bei neuen Dateien")
+    s.add_argument("--notify", action="store_true", help="Systemmitteilung bei neuen Dateien")
     s.set_defaults(func=cmd_sync)
-    sc = sub.add_parser("schedule", help="automatischen Sync per launchd einrichten")
+    sc = sub.add_parser("schedule", help="automatischen Sync im Hintergrund einrichten")
     sc.add_argument("--hours", type=float, default=2, help="Intervall in Stunden (Standard: 2)")
     sc.add_argument("--remove", action="store_true", help="automatischen Sync entfernen")
     sc.set_defaults(func=cmd_schedule)
     args = p.parse_args()
     VERBOSE, DEBUG = args.verbose, args.debug
+    setup_console(args.log_file)
+    if args.selftest:
+        return selftest()
+    # Unter Windows schließt sich das Fenster nach einem Doppelklick sofort – Ausgabe stehen lassen.
+    pause = IS_WINDOWS and args.cmd is None and not args.log_file
     try:
         args.func(args)
     except KeyboardInterrupt:
         print("\nAbgebrochen.")
         sys.exit(130)
+    finally:
+        if pause:
+            try:
+                input("\nEnter drücken zum Schließen …")
+            except (EOFError, KeyboardInterrupt):
+                pass
 
 
 if __name__ == "__main__":

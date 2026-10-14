@@ -1,4 +1,0 @@
-bash install.sh
-ilias-sync setup        # Anmeldename, „Studenten AD“, Passwort, Zielordner (Standard: ~/ILIAS)
-ilias-sync sync         # erster Sync
-ilias-sync schedule --hours 2   # optional: läuft ab jetzt alle 2 h automatisch, mit Mitteilung bei neuen Dateien
