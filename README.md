@@ -67,6 +67,9 @@ ilias-sync sync --dry-run      # nur anzeigen, was heruntergeladen würde
   bzw. einen systemd-Timer (Linux).
 - Lokal bearbeitete Dateien werden nie stillschweigend überschrieben, sondern als
   „… (lokal DATUM)“ gesichert.
+- Sitzungen, die ILIAS als „Heute: …“, „Gestern: …“ oder „21. Okt 2026, 08:30 - 10:00: …“
+  anzeigt, landen in festen Ordnern wie `2026-10-21 …` – chronologisch sortiert und ohne
+  täglich neuen Ordner. Ältere „Heute_ …“-Ordner werden beim nächsten Sync automatisch umgezogen.
 - Kurse lassen sich in der Konfigurationsdatei über `include`/`exclude` (reguläre Ausdrücke) filtern:
   - macOS/Linux: `~/.config/ilias-sync/config.json`
   - Windows: `%APPDATA%\ilias-sync\config.json`

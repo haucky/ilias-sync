@@ -30,6 +30,7 @@ import tempfile
 import time
 import unicodedata
 from dataclasses import dataclass
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import unquote, urljoin
@@ -165,6 +166,44 @@ def safe_name(name: str, max_len: int = 150) -> str:
         else:
             name = name[:max_len].rstrip()
     return name
+
+
+# ILIAS stellt Sitzungen als "Heute: Titel", "Gestern, 08:30 - 10:00: Titel" oder
+# "21. Okt 2026, 08:30 - 10:00: Titel" dar. Relative Tage ändern sich täglich – lokal
+# würde so jeden Tag ein neuer Ordner entstehen. Deshalb: festes ISO-Datum voranstellen.
+_REL_DAYS = {"vorgestern": -2, "gestern": -1, "heute": 0, "morgen": 1, "übermorgen": 2,
+             "yesterday": -1, "today": 0, "tomorrow": 1}
+_MONTHS = {"jan": 1, "feb": 2, "mär": 3, "mrz": 3, "mar": 3, "apr": 4, "mai": 5, "may": 5,
+           "jun": 6, "jul": 7, "aug": 8, "sep": 9, "okt": 10, "oct": 10, "nov": 11,
+           "dez": 12, "dec": 12}
+_TIME = r"\d{1,2}:\d{2}"
+_DAY_REL = r"(?P<rel>vorgestern|gestern|heute|morgen|übermorgen|yesterday|today|tomorrow)"
+_DAY_ABS = r"(?P<d>\d{1,2})\.\s*(?P<m>[A-Za-zÄÖÜäöü]{3,})\.?\s+(?P<y>\d{4})"
+_DAY_NUM = r"(?P<nd>\d{1,2})\.(?P<nm>\d{1,2})\.(?P<ny>\d{4})"
+# optional: ", 08:30 - 10:00" bzw. "08:30 - 22. Okt 2026, 10:00" (mehrtägig)
+_TAIL = rf"(?:,?\s*{_TIME})?(?:\s*-\s*(?:[^:]*?,\s*)?{_TIME})?"
+_SESSION_RE = re.compile(rf"^\s*(?:{_DAY_REL}|{_DAY_ABS}|{_DAY_NUM}){_TAIL}\s*:\s*(?P<title>.+)$",
+                         re.IGNORECASE)
+
+
+def stable_title(title: str, today: Optional[date] = None) -> str:
+    """"Heute: X" / "21. Okt 2026, 08:30 - 10:00: X" → "2026-10-21 X"; sonst unverändert."""
+    m = _SESSION_RE.match(title)
+    if not m:
+        return title
+    try:
+        if m.group("rel"):
+            day = (today or date.today()) + timedelta(days=_REL_DAYS[m.group("rel").lower()])
+        elif m.group("d"):
+            mon = _MONTHS.get(m.group("m")[:3].lower())
+            if not mon:
+                return title
+            day = date(int(m.group("y")), mon, int(m.group("d")))
+        else:
+            day = date(int(m.group("ny")), int(m.group("nm")), int(m.group("nd")))
+    except ValueError:
+        return title
+    return f"{day.isoformat()} {m.group('title').strip()}"
 
 
 def ref_from_href(href: str) -> Optional[int]:
@@ -469,6 +508,20 @@ class Syncer:
                 return ref
         return None
 
+    def remove_empty_dirs(self, d: Path) -> None:
+        """Leere Ordner nach oben hin aufräumen (nur innerhalb des Sync-Ordners)."""
+        try:
+            while d != self.root and self.root in d.parents:
+                junk = [p for p in d.iterdir() if p.name in (".DS_Store", "Thumbs.db", "desktop.ini")]
+                if any(p not in junk for p in d.iterdir()):
+                    return
+                for p in junk:
+                    p.unlink()
+                d.rmdir()
+                d = d.parent
+        except OSError:
+            pass
+
     def sync_course(self, course: Item) -> None:
         log(f"▸ {course.title}")
         self.walk(course.ref_id, self.root / safe_name(course.title), 0)
@@ -487,7 +540,7 @@ class Syncer:
             if it.type == "file":
                 self.sync_file(it, local_dir)
             elif it.type in CONTAINER_TYPES:
-                name = safe_name(it.title)
+                name = safe_name(stable_title(it.title))
                 if used_names.get(name, it.ref_id) != it.ref_id:
                     name = f"{name} ({it.ref_id})"
                 used_names[name] = it.ref_id
@@ -499,8 +552,25 @@ class Syncer:
         sig = file_signature(it.props)
         st = self.state.get(key)
         if st and st.get("sig") == sig and (self.root / st["path"]).exists():
-            vlog(f"unverändert: {st['path']}")
-            return
+            old = self.root / st["path"]
+            if old.parent == local_dir:
+                vlog(f"unverändert: {st['path']}")
+                return
+            # Ordner wurde umbenannt (z. B. "Heute: …" → Datum) → Datei verschieben statt neu laden
+            target = local_dir / old.name
+            rel = str(target.relative_to(self.root))
+            owner = self.owner_of(rel)
+            if not target.exists() and (owner is None or owner == key):
+                if self.dry:
+                    log(f"  [verschoben] {st['path']} → {rel}")
+                    return
+                local_dir.mkdir(parents=True, exist_ok=True)
+                os.replace(old, target)
+                st["path"] = rel
+                self.save_state()
+                log(f"  → {rel}")
+                self.remove_empty_dirs(old.parent)
+                return
         if self.dry:
             label = "geändert" if st else "neu"
             log(f"  [{label}] {(local_dir / safe_name(it.title)).relative_to(self.root)}")
@@ -539,6 +609,7 @@ class Syncer:
                         log(f"  ! lokale Änderung gesichert: {backup.name}")
                     elif old != target:
                         old.unlink()  # in ILIAS umbenannt/verschoben
+                        self.remove_empty_dirs(old.parent)
 
             local_dir.mkdir(parents=True, exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=local_dir, prefix=".ilias-dl-")
@@ -802,6 +873,11 @@ def selftest() -> None:
     """Für die Build-Pipeline: prüft, ob alle Abhängigkeiten im Binary stecken."""
     print(f"{APP} {__version__} auf {platform.system()} {platform.machine()}, Python {platform.python_version()}")
     print(f"requests {requests.__version__}, Konfiguration: {CONFIG_FILE}")
+    d = date(2026, 10, 21)
+    assert stable_title("Heute: X", d) == "2026-10-21 X"
+    assert stable_title("Gestern, 08:30 - 10:00: X", d) == "2026-10-20 X"
+    assert stable_title("21. Okt 2026, 08:30 - 10:00: X", d) == "2026-10-21 X"
+    assert stable_title("Woche 3: X", d) == "Woche 3: X"
     if not IS_MACOS:
         import keyring
         backend = keyring.get_keyring()
