@@ -15,7 +15,15 @@ New-Item -ItemType Directory -Force -Path $dir | Out-Null
 Write-Host "Lade $asset ..."
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $tmp = "$exe.download"
-Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/$repo/releases/latest/download/$asset" -OutFile $tmp
+try {
+    Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/$repo/releases/latest/download/$asset" -OutFile $tmp
+} catch {
+    Remove-Item -Force -ErrorAction SilentlyContinue $tmp
+    Write-Host "Download fehlgeschlagen: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "Bitte pruefen, ob es unter https://github.com/$repo/releases eine Version mit '$asset' gibt."
+    Write-Host 'Blockiert evtl. ein Virenscanner/Firewall den Download? Dann die .exe dort manuell herunterladen.'
+    return
+}
 Move-Item -Force $tmp $exe
 Unblock-File $exe
 

@@ -806,7 +806,7 @@ def selftest() -> None:
         import keyring
         backend = keyring.get_keyring()
         print(f"keyring-Backend: {type(backend).__module__}.{type(backend).__name__}")
-        if IS_WINDOWS and "Windows" not in type(backend).__name__:
+        if IS_WINDOWS and not type(backend).__module__.startswith("keyring.backends.Windows"):
             sys.exit("Windows-Anmeldeinformationsverwaltung nicht verfügbar")
 
 
